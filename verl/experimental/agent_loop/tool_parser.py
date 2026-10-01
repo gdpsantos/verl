@@ -303,7 +303,8 @@ class Qwen3XMLToolParser(ToolParser):
             logger.warning(f"Skipping malformed function call without '>' separator: {function_call_str!r}")
             return None
 
-        function_name = function_call_str[:end_index]
+        # Tolerate whitespace after "=" (e.g. "<function= search>").
+        function_name = function_call_str[:end_index].strip()
         param_config = get_arguments_config(function_name)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
@@ -317,7 +318,7 @@ class Qwen3XMLToolParser(ToolParser):
                 )
                 continue
 
-            param_name = match_text[:idx]
+            param_name = match_text[:idx].strip()
             param_value = str(match_text[idx + 1 :])
             # Remove prefix and trailing \n
             if param_value.startswith("\n"):
