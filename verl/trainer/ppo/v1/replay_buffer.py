@@ -132,6 +132,11 @@ class ReplayBuffer:
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
         sync_refill_failed_groups (bool): Whether sync sampling replaces failed groups with no trajectories.
+        max_num_gen_batches (int): Maximum DAPO prompt batches (``train_batch_size`` prompts each, the
+            first one included) generated per ``sample`` call before raising, as in the DAPO recipe: sync
+            counts refill dispatches, async counts DAPO-filtered groups (each one is refilled). Guards against
+            regenerating forever when (almost) every group is filtered, e.g. a broken reward or tool.
+            Non-positive values mean no limit.
     """
 
     def __init__(
@@ -148,6 +153,7 @@ class ReplayBuffer:
         gen_batch_size: int | None = None,
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
+        max_num_gen_batches: int = 0,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -161,6 +167,7 @@ class ReplayBuffer:
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
+        self.max_num_gen_batches = max_num_gen_batches
 
         if self.max_off_policy_threshold is not None:
             assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
@@ -441,6 +448,7 @@ class ReplayBuffer:
         eviction_metrics: dict = {}
         dapo_enabled = partition_id != "val" and self.filter_groups_metric is not None
         refill_credit = 0
+        dapo_refilled = 0
         draining = False
         max_inflight_prompts = 0
         if dapo_enabled:
@@ -480,6 +488,18 @@ class ReplayBuffer:
                     assert self.gen_batch_size is not None
                     dispatch_count -= dispatch_count % self.gen_batch_size
                     if dispatch_count > 0:
+                        # The step's first batch counts as one gen batch, as in the DAPO recipe.
+                        if (
+                            self.max_num_gen_batches > 0
+                            and dapo_refilled + dispatch_count > (self.max_num_gen_batches - 1) * self.train_batch_size
+                        ):
+                            raise RuntimeError(
+                                f"Sync DAPO used {self.max_num_gen_batches=} gen batches in step {global_steps} "
+                                f"without collecting {batch_size} usable groups. Almost every group is being "
+                                "filtered: check the reward function and tool calls, or set "
+                                "algorithm.filter_groups.max_num_gen_batches=0 to allow endless refills."
+                            )
+                        dapo_refilled += dispatch_count
                         assert self.refill_fn is not None
                         self.refill_fn(dispatch_count)
                         refill_credit -= dispatch_count
@@ -568,15 +588,24 @@ class ReplayBufferAsync(ReplayBuffer):
         """
         last_debug_time = time.time()
         eviction_metrics: dict = {}
+        dapo_filtered = 0
 
         while True:
             # Eviction and selection share one snapshot so newly terminal stale groups wait for the next eviction pass.
             self._sync_metadata_from_transfer_queue()
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
-            evicted_uids, stale_count, _dapo_count, metrics = self._evict_terminal_groups(
+            evicted_uids, stale_count, dapo_count, metrics = self._evict_terminal_groups(
                 global_steps, partition_id, eviction_reasons
             )
+            dapo_filtered += dapo_count
+            if self.max_num_gen_batches > 0 and dapo_filtered > (self.max_num_gen_batches - 1) * self.train_batch_size:
+                raise RuntimeError(
+                    f"DAPO filtered {dapo_filtered} groups in step {global_steps} while waiting for {target_count} "
+                    f"usable groups ({self.max_num_gen_batches=}). Almost every group is being filtered: check the "
+                    "reward function and tool calls, or set algorithm.filter_groups.max_num_gen_batches=0 to allow "
+                    "endless refills."
+                )
             if evicted_uids:
                 _accumulate_eviction_metrics(eviction_metrics, metrics, stale_count)
                 if self.refill_fn is not None:

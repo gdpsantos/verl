@@ -152,14 +152,20 @@ def test_sync_failure_refill_overrides_dataloader_generation_batch_size():
     warning.assert_any_call("data.gen_batch_size=8 is overridden to 1.")
 
 
-def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured():
+def test_builtin_filter_groups_passes_total_generation_limit():
     trainer = _trainer_with_filter_groups({"enable": True, "metric": "acc", "max_num_gen_batches": 10})
 
-    with patch("verl.trainer.ppo.v1.trainer_base.logger.warning") as warning:
-        trainer._build_replay_buffer()
+    sampler = trainer._build_replay_buffer()
 
-    warning.assert_called_once_with(
-        "algorithm.filter_groups.max_num_gen_batches=%s is ignored by the built-in V1 ReplayBuffer; "
-        "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
-        10,
+    assert sampler.max_num_gen_batches == 10
+
+
+def test_async_filter_groups_passes_total_generation_limit():
+    trainer = _trainer_with_filter_groups(
+        {"enable": True, "metric": "acc", "max_num_gen_batches": 10}, trainer_mode="separate_async"
     )
+
+    sampler = trainer._build_replay_buffer()
+
+    assert sampler.max_num_gen_batches == 10
+    assert sampler.train_batch_size == 64

@@ -60,6 +60,7 @@ def _make_rb(
     gen_batch_size: int = 1,
     max_inflight_gen_batches: int = 1,
     sync_refill_failed_groups: bool = False,
+    max_num_gen_batches: int = 0,
 ) -> ReplayBuffer:
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
@@ -76,6 +77,7 @@ def _make_rb(
         gen_batch_size=gen_batch_size,
         max_inflight_gen_batches=max_inflight_gen_batches,
         sync_refill_failed_groups=sync_refill_failed_groups,
+        max_num_gen_batches=max_num_gen_batches,
     )
 
 
@@ -1062,6 +1064,38 @@ def test_sync_dapo_refills_twice_and_clears_surplus(tq_init, partition_id):
         assert surplus_uid not in remaining
         assert _trajectory_key(surplus_uid, 0) not in remaining
         assert _trajectory_key(surplus_uid, 1) not in remaining
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_sync_dapo_raises_after_max_num_gen_batches(tq_init, partition_id):
+    # Every group, including the refills, is all-same and gets filtered: without a limit this never ends.
+    first = [PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0]) for _ in range(2)]
+    _produce(partition_id, first).join_and_check()
+
+    refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 0.0])
+    # train_batch_size=2 and max_num_gen_batches=2: the first batch plus one batch (2 prompts) of refills.
+    rb = _make_rb(refill_fn=refiller, filter_groups_metric="acc", max_num_gen_batches=2)
+    try:
+        with pytest.raises(RuntimeError, match="max_num_gen_batches"):
+            rb.sample(global_steps=1, partition_id=partition_id, batch_size=2)
+        assert refiller.calls == [2]
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_async_dapo_raises_after_max_num_gen_batches(tq_init, partition_id):
+    first = [PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0]) for _ in range(2)]
+    _produce(partition_id, first).join_and_check()
+
+    refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 0.0])
+    rb = _make_rb(
+        refill_fn=refiller, filter_groups_metric="acc", trainer_mode="separate_async", max_num_gen_batches=2
+    )
+    try:
+        with pytest.raises(RuntimeError, match="max_num_gen_batches"):
+            rb.sample(global_steps=1, partition_id=partition_id, batch_size=2)
+        assert refiller.calls == [2]
     finally:
         _clear_partition(partition_id)
 

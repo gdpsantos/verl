@@ -172,8 +172,10 @@ class PPOTrainer(ABC):
             if sampler_cls is ReplayBuffer:
                 filter_groups = self.config.algorithm.get("filter_groups", None)
                 max_inflight_gen_batches = 1
+                max_num_gen_batches = 0
                 if filter_groups_metric is not None:
                     max_inflight_gen_batches = filter_groups.get("max_inflight_gen_batches", 1)
+                    max_num_gen_batches = filter_groups.get("max_num_gen_batches", 0)
                 train_batch_size = self.config.data.train_batch_size
                 replay_buffer_kwargs.update(
                     train_batch_size=train_batch_size,
@@ -181,7 +183,15 @@ class PPOTrainer(ABC):
                     if filter_groups_metric is not None or sync_refill_failed_groups
                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
                     max_inflight_gen_batches=max_inflight_gen_batches,
+                    max_num_gen_batches=max_num_gen_batches,
                 )
+            elif filter_groups_metric is not None:
+                max_num_gen_batches = self.config.algorithm.filter_groups.get("max_num_gen_batches", 0)
+                if max_num_gen_batches > 0:
+                    replay_buffer_kwargs.update(
+                        train_batch_size=self.config.data.train_batch_size,
+                        max_num_gen_batches=max_num_gen_batches,
+                    )
         return sampler_cls(**replay_buffer_kwargs)
 
     def _resolve_filter_groups_metric(self) -> str | None:
@@ -202,13 +212,6 @@ class PPOTrainer(ABC):
             "reward.reward_model.enable_resource_pool=True. A colocated reward model computes rewards only "
             "after replay-buffer sampling."
         )
-        max_num_gen_batches = filter_groups.get("max_num_gen_batches", 0)
-        if max_num_gen_batches > 0:
-            logger.warning(
-                "algorithm.filter_groups.max_num_gen_batches=%s is ignored by the built-in V1 ReplayBuffer; "
-                "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
-                max_num_gen_batches,
-            )
         return str(filter_metric)
 
     def init(self):
@@ -504,7 +507,13 @@ class PPOTrainer(ABC):
 
             # 6. dump rollout generations if enabled
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-            if rollout_data_dir:
+            # rollout_data_at_checkpoint: only dump on the first step, checkpoint steps and the last step.
+            at_ckpt_step = (
+                self.global_steps == 1
+                or is_last_step
+                or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0)
+            )
+            if rollout_data_dir and (not self.config.trainer.get("rollout_data_at_checkpoint", False) or at_ckpt_step):
                 self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
 
             # 7. cleanup transfer queue
