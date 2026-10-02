@@ -449,6 +449,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+            - critic/score_per_source/{data_source}/mean: Mean sequence score per data source
+              (if ``data_source`` is in the non-tensor batch)
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -604,6 +606,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    # per data source score, over non-aborted samples like critic/score/*
+    if "data_source" in batch.non_tensor_batch:
+        data_sources = np.asarray(batch.non_tensor_batch["data_source"], dtype=object)
+        non_aborted = non_aborted_mask.cpu().numpy()
+        for data_source in sorted(set(data_sources[non_aborted].tolist()), key=str):
+            source_mask = torch.from_numpy((data_sources == data_source) & non_aborted).to(sequence_score.device)
+            metrics[f"critic/score_per_source/{data_source}/mean"] = (
+                torch.mean(sequence_score[source_mask]).detach().item()
+            )
 
     return metrics
 

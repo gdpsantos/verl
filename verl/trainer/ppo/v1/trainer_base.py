@@ -1887,6 +1887,7 @@ class PPOTrainer(ABC):
             "rm_scores",
             "token_level_rewards",
             "num_turns",
+            "data_source",
         ]
         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
         data = get_metric_data_with_optional_routed_experts(
@@ -1900,6 +1901,7 @@ class PPOTrainer(ABC):
         )
 
         num_turns = np.array(data.pop("num_turns").tolist())
+        data_sources = np.array(data.pop("data_source").tolist(), dtype=object)
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -1939,6 +1941,10 @@ class PPOTrainer(ABC):
         # to the ``training/num_turns/*`` names computed below.
         num_turns_for_metrics = num_turns[non_padding_mask] if non_padding_mask.any() else num_turns
         metrics_batch.non_tensor_batch["__num_turns__"] = np.asarray(num_turns_for_metrics, dtype=np.int32)
+        # compute_data_metrics emits critic/score_per_source/{data_source}/mean from this.
+        metrics_batch.non_tensor_batch["data_source"] = (
+            data_sources[non_padding_mask] if non_padding_mask.any() else data_sources
+        )
 
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})

@@ -336,6 +336,24 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertAlmostEqual(metrics["critic/score/mean"], 5.0)  # Sum of token_level_scores
         self.assertAlmostEqual(metrics["critic/rewards/mean"], 2.5)  # Sum of token_level_rewards
 
+    def test_compute_data_metrics_score_per_source(self):
+        """Per data source mean score, excluding aborted (zero-length) responses."""
+        self.batch.batch["token_level_scores"] = torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.5, 0.0], [9.0, 0.0]])
+        self.batch.batch["token_level_rewards"] = self.batch.batch["token_level_scores"]
+        self.batch.batch["advantages"] = torch.zeros((4, 2))
+        self.batch.batch["returns"] = torch.zeros((4, 2))
+        self.batch.batch["prompts"] = torch.zeros((4, 2))
+        self.batch.batch["responses"] = torch.zeros((4, 2))
+        self.batch.batch["attention_mask"] = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 1, 1], [1, 1, 0, 0]])
+        self.batch.batch["response_mask"] = self.batch.batch["attention_mask"][:, 2:]
+        self.batch.non_tensor_batch = {"data_source": np.array(["gsm8k", "gsm8k", "searchR1_ptpt", "searchR1_ptpt"])}
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertAlmostEqual(metrics["critic/score_per_source/gsm8k/mean"], 0.5)
+        # the last sample is aborted (no response tokens), so only 0.5 counts
+        self.assertAlmostEqual(metrics["critic/score_per_source/searchR1_ptpt/mean"], 0.5)
+
     def test_compute_data_metrics_without_critic(self):
         """Test compute_data_metrics with critic disabled."""
         metrics = compute_data_metrics(self.batch, use_critic=False)
