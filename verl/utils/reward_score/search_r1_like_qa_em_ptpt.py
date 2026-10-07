@@ -16,7 +16,7 @@
 
 The upstream scorer in ``search_r1_like_qa_em`` normalizes for English and
 produces false negatives on Portuguese answers. This module keeps the same
-public interface but fixes three failure modes:
+public interface but fixes five failure modes:
 
 1. Article stripping. Upstream removes only ``a|an|the``. In pt-PT that strips
    the feminine article ``a`` while leaving ``o``, ``os``, ``as``, ``um``,
@@ -27,6 +27,11 @@ public interface but fixes three failure modes:
 3. Diacritics. ``"São Tomé"`` vs ``"Sao Tome"`` scores 0 upstream. Folding is
    on by default: it removes a large class of false negatives and costs very
    little discrimination between distinct Portuguese answer spans.
+4. Ordinal indicators. NFKC turns ``ª``/``º`` into the letters ``a``/``o``, so
+   ``"6ª"`` became ``"6a"`` and never matched ``"6.ª"``. They are removed before
+   NFKC, like the other punctuation.
+5. Digit grouping. ``"3646"``, ``"3 646"`` and ``"3.646"`` are the same number;
+   separators between groups of three digits are dropped.
 
 Deliberate deviation from upstream: punctuation is replaced with a space rather
 than deleted, so ``"Lisboa-Porto"`` and ``"Lisboa Porto"`` agree. Upstream
@@ -71,6 +76,15 @@ _ARTICLE_RE = re.compile(
 _EXTRA_PUNCT = "«»“”„‘’–—―…ºª§¡¿"
 _PUNCT = set(string.punctuation) | set(_EXTRA_PUNCT)
 
+# Ordinal indicators must go before NFKC, which maps them to the letters "a"/"o".
+_ORDINAL_INDICATORS = {ord("ª"): " ", ord("º"): " "}
+
+# A number written in groups: 1-3 leading digits, then groups of exactly three
+# separated by a space or dot ("3 646", "30.295", "1 000 000"). "1985 123" is not
+# one. NFKC has already turned no-break spaces into plain ones. The decimal comma
+# is left alone ("1 143,6" -> "1143,6").
+_DIGIT_GROUP_RE = re.compile(r"(?<!\d)\d{1,3}(?:[ .]\d{3})+(?!\d)")
+
 
 def _strip_diacritics(text: str) -> str:
     """Fold accents: NFD, then drop combining marks."""
@@ -88,9 +102,13 @@ def normalize_answer(s, fold_diacritics: bool = True) -> str:
     if s is None:
         return ""
 
-    # NFKC first: unifies compatibility forms (e.g. full-width chars, ligatures)
+    text = str(s).translate(_ORDINAL_INDICATORS)
+
+    # NFKC next: unifies compatibility forms (e.g. full-width chars, ligatures)
     # and settles NFC/NFD before anything else inspects the string.
-    text = unicodedata.normalize("NFKC", str(s)).lower()
+    text = unicodedata.normalize("NFKC", text).lower()
+
+    text = _DIGIT_GROUP_RE.sub(lambda m: re.sub(r"[ .]", "", m.group()), text)
 
     if fold_diacritics:
         text = _strip_diacritics(text)

@@ -34,6 +34,13 @@ EQUIVALENT = [
     ("D. Afonso Henriques", "D Afonso Henriques"),  # punctuation
     ("25 de Abril", "25 de abril"),                 # case
     ("  Coimbra ", "Coimbra"),                      # whitespace
+    ("6ª", "6.ª"),                                  # ordinal indicator (NFKC would make it "6a")
+    ("1º", "1.º"),                                  # masculine ordinal
+    ("3646", "3 646"),                              # digit grouping with a space
+    ("30295", "30.295"),                            # digit grouping with a dot
+    ("3646", "3 646"),                         # no-break space
+    ("1000000", "1 000 000"),                       # several groups
+    ("1143,6", "1 143,6"),                          # grouping before a decimal comma
 ]
 
 
@@ -60,6 +67,19 @@ def test_nfc_nfd_forms_agree():
 def test_distinct_answers_still_score_zero():
     assert pt.compute_score(_answer("Porto"), {"target": ["Lisboa"]}) == 0.0
     assert pt.compute_score(_answer("1143"), {"target": ["1139"]}) == 0.0
+
+
+@pytest.mark.parametrize(
+    "pred,gold",
+    [
+        ("15", "1,5"),       # decimal comma is not a thousands separator
+        ("3646", "364 6"),   # a group must have exactly three digits
+        ("12345", "12 3456"),
+        ("1985 123", "1985123"),
+    ],
+)
+def test_digit_grouping_only_joins_thousands_groups(pred, gold):
+    assert pt.compute_score(_answer(pred), {"target": [gold]}) == 0.0
 
 
 def test_missing_answer_tag_scores_zero():
