@@ -1,0 +1,24 @@
+# Bash tool on clusters without Docker: one `singularity exec` per command.
+# Before launching Ray, make the CLI available to all workers, e.g. `module load singularity`
+# (or set singularity_executable to an absolute path, or to `apptainer`).
+# Build images where there is internet access and copy them to image_root:
+#   singularity build python_3.11-slim.sif docker://python:3.11-slim
+tools:
+  - class_name: verl.tools.bash_tool.BashTool
+    config:
+      type: native
+      backend: singularity
+      singularity_executable: singularity
+      singularity_exec_args: []
+      # Samples' "image" names (e.g. python:3.11-slim) resolve to <image_root>/python_3.11-slim.sif.
+      image_root: /path/to/sif_images
+      default_image: python:3.11-slim
+      # The only writable path in the sandbox; seeded from the image's contents at that path.
+      default_cwd: /workspace
+      # Per-trajectory work directories (default: $TMPDIR). Prefer node-local disk.
+      work_root: null
+      command_timeout: 60
+      setup_timeout: 600
+      eval_timeout: 600
+      max_output_chars: 10000
+      max_concurrent_starts: 16

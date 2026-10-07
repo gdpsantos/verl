@@ -1,0 +1,22 @@
+# Bash tool for the mini_swe_agent agent loop (verl/tools/bash_tool.py).
+# The tool schema is built in; add a `tool_schema:` block here only to change the
+# name or description the model sees.
+tools:
+  - class_name: verl.tools.bash_tool.BashTool
+    config:
+      type: native
+      # "docker" runs one container per trajectory. "local" runs commands on the host
+      # in a temporary directory with no isolation: debugging only.
+      backend: docker
+      docker_executable: docker # or podman
+      docker_run_args: ["--rm", "--network=none", "--cpus=1", "--memory=2g"]
+      container_lifetime: 4h
+      default_image: python:3.11-slim
+      default_cwd: /workspace
+      command_timeout: 60
+      setup_timeout: 600
+      eval_timeout: 600
+      # Keep below actor_rollout_ref.rollout.multi_turn.max_tool_response_length,
+      # otherwise the loop truncates the observation a second time.
+      max_output_chars: 10000
+      max_concurrent_starts: 16

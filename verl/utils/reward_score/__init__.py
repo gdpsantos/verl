@@ -203,6 +203,12 @@ def default_compute_score(
 
         res = search_r1_like_qa_em_ptpt.compute_score(solution_str, ground_truth)
 
+    elif data_source == "sandbox_eval" or data_source.startswith("sandbox_eval/"):
+        # Tasks run by the mini_swe_agent agent loop, e.g. "sandbox_eval/toy_bugfix".
+        from . import sandbox_eval
+
+        res = sandbox_eval.compute_score(solution_str, ground_truth, extra_info=extra_info)
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
