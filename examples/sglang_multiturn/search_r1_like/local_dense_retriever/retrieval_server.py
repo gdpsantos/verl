@@ -17,7 +17,10 @@
 
 import argparse
 import json
+import unicodedata
+import urllib.parse
 import warnings
+from collections import defaultdict
 from typing import Optional
 
 import datasets
@@ -34,6 +37,69 @@ from transformers import AutoModel, AutoTokenizer
 def load_corpus(corpus_path: str):
     corpus = datasets.load_dataset("json", data_files=corpus_path, split="train", num_proc=4)
     return corpus
+
+
+def _page_name(url_or_title: str) -> str:
+    """Page name from a URL, tolerant of how the URL was written.
+
+    Takes the part after "/wiki/" (so http/https, host and trailing "/" don't matter),
+    undoes percent-encoding and treats "_" as a space: ".../wiki/S%C3%A3o%20Tom%C3%A9"
+    and ".../wiki/São_Tomé" both give "São Tomé".
+    """
+    name = url_or_title.strip().split("#")[0].rstrip("/")
+    if "/wiki/" in name:
+        name = name.split("/wiki/", 1)[1]
+    return " ".join(urllib.parse.unquote(name).replace("_", " ").split())
+
+
+def _fold(name: str) -> str:
+    """Case- and accent-insensitive form of a page name."""
+    text = unicodedata.normalize("NFD", name.casefold())
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def find_page(url: str) -> Optional[str]:
+    """Title of the page a URL points to, or None.
+
+    Tries an exact match first, then ignores case, then also accents, so a sloppy URL
+    still opens its page but never shadows a page that matches more exactly
+    ("Baço" and "Baco" are different pages).
+    """
+    name = _page_name(url)
+    if name in pages:
+        return name
+    return page_keys["case"].get(name.casefold()) or page_keys["fold"].get(_fold(name))
+
+
+def build_page_index(corpus_path: str):
+    """Group corpus passages into whole web pages (articles) for /web_search and /page.
+
+    Passage ids look like "<article>-<chunk>"; passages are ordered by chunk number.
+    Each page gets the readable form of its corpus URL ("https://pt.wikipedia.org/wiki/São_Tomé").
+    Returns {title: {"url", "text"}} and the lookup tables used by find_page.
+    """
+    passages, urls = defaultdict(list), {}
+    with open(corpus_path) as f:
+        for line_no, line in enumerate(f):
+            doc = json.loads(line)
+            lines = doc["contents"].split("\n")
+            # The title line of "contents" is what BM25 hits report, so pages are keyed by it.
+            title = lines[0].strip('"')
+            chunk = doc.get("id", "").rsplit("-", 1)[-1]
+            order = int(chunk) if chunk.isdigit() else line_no
+            passages[title].append((order, "\n".join(lines[1:]).strip()))
+            if title not in urls and doc.get("url"):
+                urls[title] = urllib.parse.unquote(doc["url"]).replace(" ", "_")
+    pages = {
+        title: {"url": urls.get(title, "https://pt.wikipedia.org/wiki/" + title.replace(" ", "_")),
+                "text": "\n".join(text for _, text in sorted(parts))}
+        for title, parts in passages.items()
+    }
+    keys = {"case": {}, "fold": {}}
+    for title in pages:
+        keys["case"].setdefault(title.casefold(), title)
+        keys["fold"].setdefault(_fold(title), title)
+    return pages, keys
 
 
 def load_docs(corpus, doc_idxs):
@@ -381,6 +447,63 @@ def retrieve_endpoint(request: QueryRequest):
     return {"result": resp}
 
 
+class WebSearchRequest(BaseModel):
+    queries: list[str]
+    topk: Optional[int] = None
+    max_results: int = 10
+
+
+@app.post("/web_search")
+def web_search_endpoint(request: WebSearchRequest):
+    """
+    Simulated web search: the pages (title and URL) of the best-matching passages.
+
+    Retrieves `topk` passages per query and lists their pages in rank order, without
+    duplicates (a page can have several passages), at most `max_results` per query.
+
+    Input format:
+    {"queries": ["capital de Portugal"], "topk": 10, "max_results": 10}
+
+    Output format:
+    {"result": [[{"title": "Lisboa", "url": "https://pt.wikipedia.org/wiki/Lisboa"}, ...]]}
+    """
+    results = retriever.batch_search(query_list=request.queries, num=request.topk or config.retrieval_topk)
+    resp = []
+    for hits in results:
+        titles = []
+        for hit in hits:
+            title = hit.get("title") or hit["contents"].split("\n")[0].strip('"')
+            if title in pages and title not in titles:
+                titles.append(title)
+        resp.append([{"title": t, "url": pages[t]["url"]} for t in titles[: request.max_results]])
+    return {"result": resp}
+
+
+class PageRequest(BaseModel):
+    urls: list[str]
+
+
+@app.post("/page")
+def page_endpoint(request: PageRequest):
+    """
+    Open web pages by URL: the whole article (all of its passages, in order).
+
+    The URL may be written readably or percent-encoded, with http or https and a
+    trailing "/". If no page matches exactly, case and then accents are ignored.
+
+    Input format:
+    {"urls": ["https://pt.wikipedia.org/wiki/Lisboa", "https://example.com/x"]}
+
+    Output format (null when no page has that URL):
+    {"result": [{"title": "Lisboa", "url": "https://pt.wikipedia.org/wiki/Lisboa", "text": "..."}, null]}
+    """
+    resp = []
+    for url in request.urls:
+        title = find_page(url)
+        resp.append({"title": title, **pages[title]} if title else None)
+    return {"result": resp}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
     parser.add_argument(
@@ -427,6 +550,10 @@ if __name__ == "__main__":
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
     retriever = get_retriever(config)
+
+    # Whole articles as web pages, for the /web_search and /page endpoints.
+    pages, page_keys = build_page_index(args.corpus_path)
+    print(f"Page index: {len(pages)} pages")
 
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
     uvicorn.run(app, host=args.host, port=args.port)
