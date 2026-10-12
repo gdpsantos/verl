@@ -23,6 +23,9 @@ ends when the model replies without a tool call.
 | `verl/experimental/agent_loop/mini_swe_agent_loop.py` | `mini_swe_agent` loop: opens the sandbox, runs `ToolAgentLoop`, evaluates, always removes the sandbox |
 | `verl/utils/reward_score/sandbox_eval.py` | Reward: 1 if the evaluation command exited with 0, else 0 |
 | `examples/mini_swe_agent/prepare_toy_bugfix_data.py` | Toy dataset: small Python projects with one bug each |
+| `examples/mini_swe_agent/prepare_openthoughts_agent_rl.py` | Converts OpenThoughts-Agent-v1-RL (nl2bash terminal tasks) |
+| `examples/mini_swe_agent/validate_sandbox_tasks.py` | Keeps only tasks whose reference solution passes and whose no-op fails on your backend |
+| `examples/mini_swe_agent/images/` | Apptainer/Singularity definition of the shared OpenThoughts image |
 
 ## Episode lifecycle
 
@@ -55,8 +58,10 @@ For another data source, set
             "cwd": "/workspace",              # docker backend; falls back to default_cwd
             "setup_commands": ["..."],        # run before the episode
             "eval_command": "...",            # exit code 0 means solved
-            # optional: "env": {"KEY": "value"}, "eval_timeout": 900
+            # optional: "env": {"KEY": "value"}, "eval_timeout": 900,
+            #           "writable_paths": ["/output"]  (extra writable, persistent directories)
         },
+        "reference_solution": "...",          # optional, used only by validate_sandbox_tasks.py
     },
 }
 ```
@@ -74,8 +79,11 @@ have edited.
 ```bash
 python3 examples/mini_swe_agent/prepare_toy_bugfix_data.py --local_save_dir ~/data/mini_swe_agent_toy
 docker pull python:3.11-slim
-bash examples/mini_swe_agent/run_qwen3_4b_toy_bugfix.sh
+bash examples/mini_swe_agent/run_qwen3_4b_grpo.sh
 ```
+
+The script reads `DATA_DIR`, `TOOL_CONFIG` and the length settings from the environment;
+its header shows the command for OpenThoughts-Agent-v1-RL.
 
 Requirements and settings that matter:
 
@@ -138,6 +146,54 @@ mkdir -p /tmp/w && singularity --silent exec --containall --cleanenv --pwd /work
 If that fails with an error about the mount point `/workspace`, the site configuration
 doesn't allow creating mount points that are missing from the image. Use a `cwd` that
 exists in the image instead (e.g. `/srv` or `/opt`).
+
+## OpenThoughts-Agent-v1-RL (terminal tasks)
+
+[OpenThoughts-Agent-v1-RL](https://huggingface.co/datasets/open-thoughts/OpenThoughts-Agent-v1-RL)
+has 728 short terminal tasks derived from nl2bash. Each task gives seed files in `/workspace`
+and asks for a command whose combined stdout and stderr goes to
+`/output/command_capture.txt`, which must equal the expected output byte for byte. All tasks
+share one Ubuntu 24.04 image, so a single `.sif` covers the dataset.
+
+Steps 1–2 need internet access; steps 3–4 can run offline, and step 4 must run where you train.
+
+```bash
+# 1. Download the tasks
+wget https://huggingface.co/datasets/open-thoughts/OpenThoughts-Agent-v1-RL/resolve/main/tasks.parquet
+
+# 2. Build the shared image (copy the .sif to the tool config's image_root)
+singularity build openthoughts_agent_rl.sif examples/mini_swe_agent/images/openthoughts_agent_rl.def
+
+# 3. Convert: seeds are inlined, the grader becomes eval_command
+python3 examples/mini_swe_agent/prepare_openthoughts_agent_rl.py \
+    --tasks_parquet tasks.parquet --local_save_dir ~/data/openthoughts_agent_rl
+
+# 4. Validate with the tool config you train with, on the cluster
+module load singularity
+python3 examples/mini_swe_agent/validate_sandbox_tasks.py \
+    --data ~/data/openthoughts_agent_rl/train.parquet ~/data/openthoughts_agent_rl/test.parquet \
+    --tool_config examples/mini_swe_agent/config/bash_tool_config_singularity.yaml \
+    --output_dir ~/data/openthoughts_agent_rl_validated
+```
+
+**Run the validation on the training cluster, with the same tool config.** About 30% of
+the tasks don't survive it, and the exact set depends on the machine:
+
+- **File order.** Many expected outputs list files in the order the original Docker
+  filesystem returned them (e.g. from an unsorted `find`). Other filesystems return a
+  different order, and the model has no way to know the original one.
+- **Root.** `chown`, `chgrp` and outputs that show `root` ownership need root, and the
+  sandbox runs as your user.
+- **Broken reference solutions.** Some reference commands rely on context that wasn't
+  recorded: input on stdin, unset variables, a different bash error format.
+
+Two tasks are skipped at conversion because their seed files are random data that can't
+be compressed below the 128 KiB command-line limit. The converter sets `TZ=UTC` and
+`LANG=C.UTF-8` for every task, matching the environment the expected outputs were
+recorded in.
+
+In a test run with Apptainer 1.5 on local disk, 514 of 726 tasks passed
+(489 train, 25 test).
 
 ## Using real SWE datasets
 

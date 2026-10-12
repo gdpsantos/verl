@@ -1,0 +1,32 @@
+# Shared image for all OpenThoughts-Agent-v1-RL tasks (they use one identical Dockerfile).
+# Build where there is internet access, then copy the .sif to the cluster:
+#   singularity build openthoughts_agent_rl.sif openthoughts_agent_rl.def
+# (or `apptainer build ...`; unprivileged builds may need --fakeroot)
+Bootstrap: docker
+From: ubuntu:24.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    # Same package list as the dataset's Dockerfile.
+    apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        less \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        unzip \
+        vim \
+        wget
+    rm -rf /var/lib/apt/lists/*
+    # Mount points for the writable sandbox directories.
+    mkdir -p /workspace /output
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive

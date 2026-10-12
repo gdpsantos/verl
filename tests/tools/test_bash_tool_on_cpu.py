@@ -224,12 +224,21 @@ def test_singularity_argv_and_image_resolution(tmp_path):
     env.workdir = "/host/work"
     argv = env.exec_argv("ls")
     assert argv[:5] == ["apptainer", "--silent", "exec", "--containall", "--cleanenv"]
-    assert argv[5:9] == ["--pwd", "/workspace", "--bind", "/host/work:/workspace"]
+    assert argv[5:9] == ["--pwd", "/workspace", "--bind", "/host/work/0:/workspace"]
     assert "--env" in argv and "FOO=1" in argv and "PAGER=cat" in argv
     assert argv[-6:] == ["--no-mount", "cwd", f"{tmp_path}/python_3.11-slim.sif", "bash", "-lc", "ls"]
 
-    with pytest.raises(ValueError, match="other than '/'"):
+    env = tool._make_environment(SandboxSpec(image="x.sif", writable_paths=["/output", "/workspace"]))
+    env.workdir = "/host/work"
+    argv = env.exec_argv("ls")
+    assert argv[7:11] == ["--bind", "/host/work/0:/workspace", "--bind", "/host/work/1:/output"]
+    assert "--bind" not in argv[11:]
+
+    with pytest.raises(ValueError, match="not '/'"):
         tool._make_environment(SandboxSpec(image="x.sif", cwd="/"))
+    with pytest.raises(ValueError, match="must be absolute"):
+        tool._make_environment(SandboxSpec(image="x.sif", writable_paths=["output"]))
+    assert SandboxSpec.from_value({"writable_paths": np.array(["/output"])}).writable_paths == ["/output"]
 
 
 def _singularity_executable() -> str | None:
@@ -261,14 +270,14 @@ def _singularity_tool(**config) -> BashTool:
 async def test_singularity_seeds_cwd_and_isolates(monkeypatch):
     monkeypatch.setenv("VERL_TEST_SECRET", "leak")
     tool = _singularity_tool(env={"FOO": "bar"}, command_timeout=2)
-    # /usr/local/bin exists in python images: its contents are copied into the writable cwd.
-    await tool.open_session("s", SandboxSpec(cwd="/usr/local/bin"))
+    # /etc/skel exists in Debian and Ubuntu images: its contents are copied into the writable cwd.
+    await tool.open_session("s", SandboxSpec(cwd="/etc/skel"))
     workdir = tool._sessions["s"].env.workdir
     try:
-        result = await tool.run_command("s", "ls; touch created; mkdir ro && chmod 555 ro")
-        assert result.returncode == 0 and "python3" in result.output.split()
+        result = await tool.run_command("s", "ls -a; touch created; mkdir ro && chmod 555 ro")
+        assert result.returncode == 0 and ".bashrc" in result.output.split()
         result = await tool.run_command("s", 'pwd; ls created; echo "FOO=$FOO SECRET=$VERL_TEST_SECRET"')
-        assert result.output == "/usr/local/bin\ncreated\nFOO=bar SECRET=\n"
+        assert result.output == "/etc/skel\ncreated\nFOO=bar SECRET=\n"
         result = await tool.run_command("s", "touch /usr/lib/x")
         assert result.returncode != 0 and "Read-only" in result.output
 
@@ -280,12 +289,28 @@ async def test_singularity_seeds_cwd_and_isolates(monkeypatch):
     assert not os.path.exists(workdir)
 
     # A new session starts from the pristine image again.
-    await tool.open_session("s2", SandboxSpec(cwd="/usr/local/bin"))
+    await tool.open_session("s2", SandboxSpec(cwd="/etc/skel"))
     try:
         result = await tool.run_command("s2", "ls created")
         assert result.returncode != 0
     finally:
         await tool.close_session("s2")
+
+
+@requires_singularity
+@pytest.mark.asyncio
+async def test_singularity_writable_paths_persist():
+    tool = _singularity_tool()
+    await tool.open_session("s", SandboxSpec(writable_paths=["/output"]))
+    workdir = tool._sessions["s"].env.workdir
+    try:
+        result = await tool.run_command("s", "echo captured > /output/capture.txt && echo here > local.txt")
+        assert result.returncode == 0, result.output
+        result = await tool.run_command("s", "cat /output/capture.txt local.txt; ls /output")
+        assert result.output == "captured\nhere\ncapture.txt\n"
+    finally:
+        await tool.close_session("s")
+    assert not os.path.exists(workdir)
 
 
 @requires_singularity

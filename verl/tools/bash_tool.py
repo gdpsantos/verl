@@ -80,8 +80,10 @@ class SandboxSpec:
     Attributes:
         image: Docker image, or for the singularity backend a .sif path or an image name
             resolved under the tool's ``image_root``. Ignored by the local backend.
-        cwd: Working directory inside the container. With singularity it is the only writable,
-            persistent path. Ignored by the local backend, which uses a fresh temporary directory.
+        cwd: Working directory inside the container. With singularity it is writable and
+            persistent. Ignored by the local backend, which uses a fresh temporary directory.
+        writable_paths: Extra absolute directories that must be writable and persist across
+            commands (singularity binds a host directory for each; docker creates them).
         env: Extra environment variables for every command.
         setup_commands: Commands run before the episode; any non-zero exit aborts the rollout.
         eval_command: Command run after the episode; exit code 0 means the task is solved.
@@ -94,6 +96,7 @@ class SandboxSpec:
     setup_commands: list[str] = field(default_factory=list)
     eval_command: Optional[str] = None
     eval_timeout: Optional[float] = None
+    writable_paths: list[str] = field(default_factory=list)
 
     @classmethod
     def from_value(cls, value: Any) -> "SandboxSpec":
@@ -104,7 +107,8 @@ class SandboxSpec:
             value = json.loads(value)
         if not isinstance(value, dict):
             raise TypeError(f"Sandbox spec must be a dict or JSON string, got {type(value).__name__}")
-        unknown = set(value) - {"image", "cwd", "env", "setup_commands", "eval_command", "eval_timeout"}
+        known = {"image", "cwd", "env", "setup_commands", "eval_command", "eval_timeout", "writable_paths"}
+        unknown = set(value) - known
         if unknown:
             raise ValueError(f"Unknown sandbox spec keys: {sorted(unknown)}")
         # Parquet round-trips may turn lists into numpy arrays and missing struct fields into None.
@@ -112,6 +116,9 @@ class SandboxSpec:
         if isinstance(setup_commands, str):
             setup_commands = [setup_commands]
         eval_timeout = value.get("eval_timeout")
+        writable_paths = value.get("writable_paths")
+        if isinstance(writable_paths, str):
+            writable_paths = [writable_paths]
         return cls(
             image=value.get("image") or None,
             cwd=value.get("cwd") or None,
@@ -119,6 +126,7 @@ class SandboxSpec:
             setup_commands=[str(c) for c in setup_commands] if setup_commands is not None else [],
             eval_command=value.get("eval_command") or None,
             eval_timeout=float(eval_timeout) if eval_timeout is not None else None,
+            writable_paths=[str(p) for p in writable_paths] if writable_paths is not None else [],
         )
 
 
@@ -252,10 +260,10 @@ def _force_rmtree(path: str) -> None:
 class SingularityEnvironment(SandboxEnvironment):
     """Runs every command with its own ``singularity exec`` of a SIF image.
 
-    Only ``cwd`` is writable and persists across commands: it is a host directory bound
-    into the container, seeded at start with whatever the image has at that path (e.g. a
-    repository). Everything else is the read-only image, with a private /tmp and home
-    (``--containall``) and none of the trainer's environment variables (``--cleanenv``).
+    Only ``cwd`` and ``writable_paths`` are writable and persist across commands: each is a
+    host directory bound into the container, seeded at start with whatever the image has at
+    that path (e.g. a repository). Everything else is the read-only image, with a private /tmp
+    and home (``--containall``) and none of the trainer's environment variables (``--cleanenv``).
     No process outlives a command, so nothing is left behind if a worker crashes.
     Works with SingularityCE 3.x/4.x and Apptainer (``executable: apptainer``).
     """
@@ -273,9 +281,12 @@ class SingularityEnvironment(SandboxEnvironment):
         work_root: Optional[str],
         start_timeout: float,
         max_capture_bytes: int,
+        writable_paths: Sequence[str] = (),
     ):
-        if cwd == "/":
-            raise ValueError("The singularity backend needs a cwd other than '/' (it is bound to a host directory)")
+        self.mount_points = [cwd, *(path for path in writable_paths if path != cwd)]
+        for path in self.mount_points:
+            if not path.startswith("/") or path.rstrip("/") == "":
+                raise ValueError(f"Singularity writable paths must be absolute and not '/', got {path!r}")
         self.image = image
         self.cwd = cwd
         self.env = env
@@ -285,10 +296,14 @@ class SingularityEnvironment(SandboxEnvironment):
         self.work_root = work_root
         self.start_timeout = start_timeout
         self.max_capture_bytes = max_capture_bytes
+        # Session directory on the host; mount point i is backed by <workdir>/<i>.
         self.workdir: Optional[str] = None
 
     def _base_argv(self) -> list[str]:
         return [self.executable, "--silent", "exec", "--containall", "--cleanenv"]
+
+    def _bind_args(self) -> list[str]:
+        return [arg for i, path in enumerate(self.mount_points) for arg in ("--bind", f"{self.workdir}/{i}:{path}")]
 
     def exec_argv(self, command: str) -> list[str]:
         env_args = [arg for key, value in self.env.items() for arg in ("--env", f"{key}={value}")]
@@ -296,8 +311,7 @@ class SingularityEnvironment(SandboxEnvironment):
             *self._base_argv(),
             "--pwd",
             self.cwd,
-            "--bind",
-            f"{self.workdir}:{self.cwd}",
+            *self._bind_args(),
             *env_args,
             *self.exec_args,
             self.image,
@@ -306,18 +320,23 @@ class SingularityEnvironment(SandboxEnvironment):
         ]
 
     def seed_argv(self) -> list[str]:
-        cwd = shlex.quote(self.cwd)
-        script = (
-            f"if [ -d {cwd} ]; then cd {cwd} && "
-            f"if command -v tar >/dev/null 2>&1; then tar cf - . | tar xf - -C {self.SEED_MOUNT}; "
-            f"else cp -R . {self.SEED_MOUNT}/; fi; fi"
-        )
+        copies = []
+        for i, path in enumerate(self.mount_points):
+            src, dst = shlex.quote(path), f"{self.SEED_MOUNT}/{i}"
+            copies.append(
+                f"if [ -d {src} ]; then (cd {src} && "
+                f"if command -v tar >/dev/null 2>&1; then tar cf - . | tar xf - -C {dst}; "
+                f"else cp -R . {dst}/; fi) || exit 1; fi"
+            )
+        script = "; ".join(copies)
         return [*self._base_argv(), "--bind", f"{self.workdir}:{self.SEED_MOUNT}", self.image, "sh", "-c", script]
 
     async def start(self) -> None:
         if "://" not in self.image and not os.path.exists(self.image):
             raise FileNotFoundError(f"Singularity image not found: {self.image}")
         self.workdir = tempfile.mkdtemp(prefix="verl-bash-", dir=self.work_root)
+        for i in range(len(self.mount_points)):
+            os.mkdir(os.path.join(self.workdir, str(i)))
         result = await _run_process(
             self.seed_argv(), self.start_timeout, self.max_capture_bytes, kill_process_group=True
         )
@@ -352,9 +371,11 @@ class DockerEnvironment(SandboxEnvironment):
         container_lifetime: str,
         start_timeout: float,
         max_capture_bytes: int,
+        writable_paths: Sequence[str] = (),
     ):
         self.image = image
         self.cwd = cwd
+        self.writable_paths = list(writable_paths)
         self.env = env
         self.shell = shell
         self.executable = executable
@@ -391,6 +412,12 @@ class DockerEnvironment(SandboxEnvironment):
         if result.timed_out or result.returncode != 0:
             raise RuntimeError(f"Failed to start container from image {self.image!r}: {result.output.strip()}")
         self.container_id = result.output.strip().splitlines()[-1]
+        if self.writable_paths:
+            mkdir = "mkdir -p " + " ".join(shlex.quote(p) for p in self.writable_paths)
+            result = await self.execute(mkdir, self.start_timeout)
+            if result.returncode != 0:
+                await self.stop()
+                raise RuntimeError(f"Failed to create writable paths in container: {result.output.strip()}")
 
     async def execute(self, command: str, timeout: float) -> CommandResult:
         # On timeout only the docker client is killed; a runaway process keeps running in
@@ -505,6 +532,7 @@ class BashTool(BaseTool):
                 work_root=self.work_root,
                 start_timeout=self.start_timeout,
                 max_capture_bytes=self.max_capture_bytes,
+                writable_paths=spec.writable_paths,
             )
         return DockerEnvironment(
             image=image,
@@ -516,6 +544,7 @@ class BashTool(BaseTool):
             container_lifetime=self.container_lifetime,
             start_timeout=self.start_timeout,
             max_capture_bytes=self.max_capture_bytes,
+            writable_paths=spec.writable_paths,
         )
 
     async def open_session(self, session_id: str, spec: SandboxSpec) -> None:

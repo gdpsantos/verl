@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # GRPO | Qwen3-4B | FSDP | mini_swe_agent loop with a sandboxed bash tool
 #
-# Prepare the data first:
+# Any dataset produced by a prepare_*.py script in this folder works; see README.md.
+# Toy bug-fixing tasks (default):
 #   python3 examples/mini_swe_agent/prepare_toy_bugfix_data.py --local_save_dir ~/data/mini_swe_agent_toy
+# OpenThoughts-Agent-v1-RL on a cluster with Singularity (after converting and validating):
+#   module load singularity
+#   DATA_DIR=~/data/openthoughts_agent_rl_validated \
+#   TOOL_CONFIG=examples/mini_swe_agent/config/bash_tool_config_singularity.yaml \
+#   MAX_PROMPT_LENGTH=1024 MAX_RESPONSE_LENGTH=4096 MAX_ASSISTANT_TURNS=10 \
+#   EXPERIMENT_NAME=qwen3_4b_openthoughts_agent_rl bash examples/mini_swe_agent/run_qwen3_4b_grpo.sh
 # The default tool config uses Docker: the user running Ray workers must be able to run
-# `docker run` (or set docker_executable: podman). On clusters without Docker, run
-# `module load singularity` first and set
-#   TOOL_CONFIG=examples/mini_swe_agent/config/bash_tool_config_singularity.yaml
-# after pointing its image_root at your .sif files (see README.md).
+# `docker run` (or set docker_executable: podman).
 
 set -xeuo pipefail
 
@@ -33,7 +37,7 @@ ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 ROLLOUT_N=${ROLLOUT_N:-8}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_mini_swe_agent}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_toy_bugfix}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_mini_swe_agent}
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-5}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-2}
