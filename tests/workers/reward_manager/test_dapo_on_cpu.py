@@ -125,3 +125,28 @@ def test_reward_loop_construct_with_overlong_buffer_disabled():
         config=config, tokenizer=_DummyTokenizer(), compute_score=_constant_compute_score
     )
     assert reward_manager.max_resp_len is None
+
+
+def test_reward_loop_passes_tool_extra_fields_to_compute_score():
+    """Agent-loop extra fields (e.g. mini_swe_agent's sandbox_eval) must reach compute_score, as in naive."""
+    import asyncio
+
+    seen = {}
+
+    def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+        seen.update(extra_info)
+        return 1.0 if extra_info["sandbox_eval"]["returncode"] == 0 else 0.0
+
+    config = OmegaConf.create({"reward": {"reward_kwargs": {}}})
+    data = _make_data(batch_size=1)
+    data.non_tensor_batch["extra_info"] = np.array([{"index": 0}], dtype=object)
+    data.non_tensor_batch["tool_extra_fields"] = np.array([{"sandbox_eval": {"returncode": 0}}], dtype=object)
+    data.non_tensor_batch["__num_turns__"] = np.array([5])
+
+    async def run():
+        manager = RewardLoopDAPORewardManager(config=config, tokenizer=_DummyTokenizer(), compute_score=compute_score)
+        return await manager.run_single(data)
+
+    result = asyncio.run(run())
+    assert result["reward_score"] == 1.0
+    assert seen["index"] == 0 and seen["num_turns"] == 5
